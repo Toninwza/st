@@ -1,0 +1,203 @@
+สรุปขั้นตอนทั้งหมดที่ทำ
+
+Architecture
+WSL (Windows)
+└── Docker
+    ├── tower   ← Ansible Control Node
+    ├── worker1 ← ติดตั้ง Docker + Nginx-proxy + Portainer
+    └── worker2 ← ติดตั้ง Docker + Nginx-proxy + Portainer
+
+Step 1 — เตรียม Environment (WSL)
+mkdir ~/ansible-lab && cd ~/ansible-lab
+# สร้าง docker-compose.yml แล้วรัน
+docker compose up -d
+
+Step 2 — Setup tower container
+docker exec -it tower bash
+pip3 install ansible
+ansible-galaxy collection install community.docker
+apt update && apt install -y openssh-server
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
+
+Step 3 — เตรียม worker ให้ SSH ได้ (WSL)
+sudo docker exec -it worker1 bash -c "apt update && apt install -y openssh-server"
+docker exec worker1 service ssh start
+sudo docker exec -it worker2 bash -c "apt update && apt install -y openssh-server"
+docker exec worker2 service ssh start
+docker exec worker1 bash -c "echo 'root:root' | chpasswd"
+docker exec worker2 bash -c "echo 'root:root' | chpasswd"
+docker exec worker1 bash -c "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && service ssh restart"
+docker exec worker2 bash -c "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && service ssh restart"
+sudo docker exec -it worker3 bash -c "apt update && apt install -y openssh-server"
+docker exec worker3 service ssh start
+docker exec worker3 bash -c "echo 'root:root' | chpasswd"
+docker exec worker3 bash -c "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && service ssh restart"
+exec tower
+ssh-copy-id root@worker3
+
+docker exec worker4 bash -c "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && service ssh restart"
+
+
+
+Step 4 — Copy SSH key จาก tower (ใน tower)
+ssh-copy-id root@worker1
+ssh-copy-id root@worker2
+
+Step 5 — สร้าง Ansible config (ใน tower)
+mkdir -p ~/ansible-lab && cd ~/ansible-lab
+
+cat > inventory.ini << 'EOF'
+[workers]
+worker1 ansible_host=172.18.0.5
+worker2 ansible_host=172.18.0.6
+worker3 ansible_host=172.18.0.4
+
+[all:vars]
+ansible_user=root
+ansible_python_interpreter=/usr/bin/python3
+EOF
+
+cat > ansible.cfg << 'EOF'
+[defaults]
+inventory = inventory.ini
+host_key_checking = False
+deprecation_warnings = False
+EOF
+
+Step 6 — เขียน Playbook (ใน tower)
+
+
+sudo apt update
+sudo apt install nano
+
+
+cat > playbooks/site.yml << 'EOF'
+- name: Setup Workers
+  hosts: workers
+  become: true
+  tasks:
+    - name: Clean apt cache and old docker repo
+      shell: |
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+        rm -f /etc/apt/sources.list.d/docker.list
+        rm -f /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
+        rm -f /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg
+
+    - name: Update apt cache
+      shell: apt-get update --fix-missing -o Acquire::BrokenProxy=true
+      ignore_errors: true
+
+    - name: Install dependencies
+      shell: apt-get install -y --fix-missing ca-certificates curl python3-pip
+
+    - name: Install Python requests and docker
+      shell: pip3 install requests docker
+
+    - name: Add Docker GPG key
+      shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+
+    - name: Add Docker repo
+      shell: |
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu jammy stable" > /etc/apt/sources.list.d/docker.list
+
+    - name: Install Docker Engine
+      shell: apt-get update --fix-missing -o Acquire::BrokenProxy=true; apt-get install -y --fix-missing docker-ce docker-ce-cli containerd.io
+      ignore_errors: false
+
+    - name: Configure Docker daemon
+      ansible.builtin.copy:
+        content: |
+          {
+            "default-address-pools": [{"base":"172.29.2.0/16","size":24}],
+            "bip": "172.29.2.1/24",
+            "log-driver": "json-file",
+            "log-opts": {"max-size": "100m", "max-file": "5"}
+          }
+        dest: /etc/docker/daemon.json
+      notify: Restart Docker
+
+    - name: Start Docker service
+      shell: service docker restart
+
+    - name: Install Nginx
+      shell: apt-get install -y --fix-missing nginx
+
+    - name: Install Python requests and docker
+      shell: pip3 install requests docker
+
+    - name: Run Nginx Proxy container
+      community.docker.docker_container:
+        name: nginx-proxy
+        image: nginxproxy/nginx-proxy:1.7
+        ports:
+          - "80:80"
+        volumes:
+          - /var/run/docker.sock:/tmp/docker.sock:ro
+        restart_policy: always
+
+    - name: Create SSL certificate directory
+      ansible.builtin.file:
+        path: /etc/ssl/supalai_cert
+        state: directory
+        mode: '0755'
+
+    - name: Run Portainer Agent
+      community.docker.docker_container:
+        name: portainer_agent
+        image: portainer/agent:latest
+        ports:
+          - "9001:9001"
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - /var/lib/docker/volumes:/var/lib/docker/volumes
+        restart_policy: always
+        
+    - name: Create logrotate config for nginx reverse proxy
+      ansible.builtin.copy:
+        content: |
+          /var/log/nginx/reverse-proxy/*.log {
+                  monthly
+                  rotate 12
+                  compress
+                  delaycompress
+                  missingok
+                  notifempty
+                  create 644 root root
+          }
+        dest: /etc/logrotate.d/nginx-reverse-proxy-log
+        mode: '0644'
+EOF
+Step 7 — รัน Playbook (ใน tower)
+ansible workers -m ping        # verify ก่อน
+ansible-playbook playbooks/site.yml
+
+Step 8 — Verify
+ansible workers -m shell -a "docker --version"
+ansible workers -m shell -a "docker ps"
+
+ผลลัพธ์
+worker1 ✅  Docker Engine + nginx-proxy (port 80) + Portainer CE (port 9443)
+worker2 ✅  Docker Engine + nginx-proxy (port 80) + Portainer CE (port 9443)
+
+รหัส portainer
+itonsplitonspl5
+admin
+
+awx
+h0WpzCNQexErlMgbSIirF8xtuCeg7j4t
+///note พื้นที่ว่างไม่เกี่ยวกับงาน
+sudo docker exec -it worker3 bash -c "apt update && apt install -y openssh-server"
+docker exec worker3 service ssh start
+docker exec worker3 bash -c "echo 'root:root' | chpasswd"
+docker exec worker3 bash -c "sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && service ssh restart"
+
+exec tower
+ssh-copy-id root@worker3
+
+172.18.0.3
+172.18.0.4
+172.18.0.5
